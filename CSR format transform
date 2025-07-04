@@ -1,0 +1,443 @@
+#define _CRT_SECURE_NO_WARNINGS
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <string.h>
+
+#define MAX_NNZ 3000000
+#define MAX_PEC 50000
+
+static const double PI = 3.14159265358979323846;
+static const double mu0 = 4.0 * PI * 1e-7;
+static const double eps0 = 1.0 / (36.0 * PI) * 1e-9;
+
+typedef struct {
+    int row;
+    int col;
+    double value;
+} SparseEntry;
+
+static inline double dot3(const double* a, const double* b) {
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+void cross3(const double* a, const double* b, double* out) {
+    out[0] = a[1] * b[2] - a[2] * b[1];
+    out[1] = a[2] * b[0] - a[0] * b[2];
+    out[2] = a[0] * b[1] - a[1] * b[0];
+}
+
+static void det_inv_4x4(const double X[4][4], double* det_out, double invX[4][4]) {
+    double A[4][8];
+    for (int i = 0; i < 4; i++) {
+        memcpy(A[i], X[i], 4 * sizeof(double));
+        for (int j = 0; j < 4; j++) A[i][j + 4] = (i == j) ? 1.0 : 0.0;
+    }
+    double det = 1.0;
+    for (int i = 0; i < 4; i++) {
+        int piv = i;
+        for (int r = i + 1; r < 4; r++)
+            if (fabs(A[r][i]) > fabs(A[piv][i])) piv = r;
+        if (piv != i) {
+            for (int c = 0; c < 8; c++) { double tmp = A[i][c]; A[i][c] = A[piv][c]; A[piv][c] = tmp; }
+            det = -det;
+        }
+        double d = A[i][i];
+        if (fabs(d) < 1e-16) { fprintf(stderr, "Singular matrix\n"); exit(EXIT_FAILURE); }
+        det *= d;
+        for (int c = 0; c < 8; c++) A[i][c] /= d;
+        for (int r = 0; r < 4; r++) if (r != i) {
+            double f = A[r][i];
+            for (int c = 0; c < 8; c++) A[r][c] -= f * A[i][c];
+        }
+    }
+    *det_out = det;
+    for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) invX[i][j] = A[i][j + 4];
+}
+
+void add_sparse(SparseEntry* S, int* nnz, int i, int j, double value) {
+    for (int idx = 0; idx < *nnz; idx++) {
+        if (S[idx].row == i && S[idx].col == j) {
+            S[idx].value += value;
+            return;
+        }
+    }
+    if (*nnz < MAX_NNZ) {
+        S[*nnz].row = i;
+        S[*nnz].col = j;
+        S[*nnz].value = value;
+        (*nnz)++;
+    }
+    else {
+        printf("Sparse array overflow!\n");
+        exit(1);
+    }
+}
+
+int is_PEC_edge(int idx, int* pec_idx, int pec_cnt) {
+    for (int i = 0; i < pec_cnt; i++) {
+        if (pec_idx[i] == idx) return 1;
+    }
+    return 0;
+}
+int is_PEC_face(int idx, int* pec_idx, int pec_cnt) {
+    for (int i = 0; i < pec_cnt; i++) {
+        if (pec_idx[i] == idx) return 1;
+    }
+    return 0;
+}
+
+void coo_to_csr(SparseEntry* coo, int nnz, int nrow, int ncol, double** values, int** col_indices, int** row_ptr) {
+    *values = (double*)malloc(nnz * sizeof(double));
+    *col_indices = (int*)malloc(nnz * sizeof(int));
+    *row_ptr = (int*)calloc((nrow + 1), sizeof(int));
+    for (int i = 0; i < nnz; i++)
+        if (coo[i].row < nrow && coo[i].col < ncol)
+            (*row_ptr)[coo[i].row + 1]++; // 각 행 개수
+    for (int i = 0; i < nrow; i++)
+        (*row_ptr)[i + 1] += (*row_ptr)[i];
+    int* cur = (int*)calloc(nrow, sizeof(int));
+    for (int i = 0; i < nnz; i++) {
+        int r = coo[i].row;
+        int c = coo[i].col;
+        if (r < nrow && c < ncol) {
+            int dest = (*row_ptr)[r] + cur[r];
+            (*values)[dest] = coo[i].value;
+            (*col_indices)[dest] = coo[i].col;
+            cur[r]++;
+        }
+    }
+    free(cur);
+}
+
+void print_csr(double* values, int* col_indices, int* row_ptr, int nrow, int nnz) {
+    printf("values = [");
+    for (int i = 0; i < nnz; i++) printf("%.6e%s", values[i], i == nnz - 1 ? "]\n" : ", ");
+    printf("col_indices = [");
+    for (int i = 0; i < nnz; i++) printf("%d%s", col_indices[i], i == nnz - 1 ? "]\n" : ", ");
+    printf("row_ptr = [");
+    for (int i = 0; i <= nrow; i++) printf("%d%s", row_ptr[i], i == nrow ? "]\n" : ", ");
+}
+
+int main(void) {
+    FILE* fp;
+    int N0, N1, N2, N3;
+    double* nod_crdn = NULL;
+    int* ele_nod = NULL, * ele_edg = NULL, * ele_fac = NULL, * edg_nod = NULL, * fac_edg = NULL;
+    int* pec_edg_idx = NULL, * pec_fac_idx = NULL;
+    int pec_edg_cnt = 0, pec_fac_cnt = 0;
+
+    // nod_crdn.txt
+    fp = fopen("C:/Users/owner/source/repos/333333/nod_crdn.txt", "r");
+    if (!fp) { perror("nod_crdn.txt"); return 1; }
+    if (fscanf(fp, "%d", &N0) != 1) { fprintf(stderr, "Failed to read node count\n"); fclose(fp); return 1; }
+    nod_crdn = (double*)malloc(3 * N0 * sizeof(double));
+    for (int i = 0; i < N0; i++)
+        fscanf(fp, "%lf %lf %lf", &nod_crdn[3 * i], &nod_crdn[3 * i + 1], &nod_crdn[3 * i + 2]);
+    fclose(fp);
+
+    // edg_nod.txt
+    fp = fopen("C:/Users/owner/source/repos/333333/edg_nod.txt", "r");
+    if (!fp) { perror("edg_nod.txt"); return 1; }
+    if (fscanf(fp, "%d", &N1) != 1) { fprintf(stderr, "Failed to read edge count\n"); fclose(fp); return 1; }
+    edg_nod = (int*)malloc(2 * N1 * sizeof(int));
+    for (int i = 0; i < N1; i++) {
+        fscanf(fp, "%d %d", &edg_nod[2 * i], &edg_nod[2 * i + 1]);
+        edg_nod[2 * i] -= 1; edg_nod[2 * i + 1] -= 1;
+    }
+    fclose(fp);
+
+    // ele_edg.txt
+    fp = fopen("C:/Users/owner/source/repos/333333/ele_edg.txt", "r");
+    if (!fp) { perror("ele_edg.txt"); return 1; }
+    if (fscanf(fp, "%d", &N3) != 1) { fprintf(stderr, "Failed to read element count\n"); fclose(fp); return 1; }
+    ele_edg = (int*)malloc(6 * N3 * sizeof(int));
+    for (int k = 0; k < N3; k++) {
+        fscanf(fp, "%d %d %d %d %d %d",
+            &ele_edg[6 * k], &ele_edg[6 * k + 1], &ele_edg[6 * k + 2],
+            &ele_edg[6 * k + 3], &ele_edg[6 * k + 4], &ele_edg[6 * k + 5]);
+        for (int a = 0; a < 6; a++) ele_edg[6 * k + a] -= 1;
+    }
+    fclose(fp);
+
+    // ele_nod.txt
+    fp = fopen("C:/Users/owner/source/repos/333333/ele_nod.txt", "r");
+    if (!fp) { perror("ele_nod.txt"); return 1; }
+    int N3_check;
+    if (fscanf(fp, "%d", &N3_check) != 1 || N3_check != N3) { fprintf(stderr, "Element count mismatch!\n"); fclose(fp); return 1; }
+    ele_nod = (int*)malloc(4 * N3 * sizeof(int));
+    for (int k = 0; k < N3; k++) {
+        fscanf(fp, "%d %d %d %d", &ele_nod[4 * k], &ele_nod[4 * k + 1], &ele_nod[4 * k + 2], &ele_nod[4 * k + 3]);
+        for (int a = 0; a < 4; a++) ele_nod[4 * k + a] -= 1;
+    }
+    fclose(fp);
+
+    // fac_edg.txt
+    fp = fopen("C:/Users/owner/source/repos/333333/fac_edg.txt", "r");
+    if (!fp) { perror("fac_edg.txt"); return 1; }
+    if (fscanf(fp, "%d", &N2) != 1) { fprintf(stderr, "Failed to read face count\n"); fclose(fp); return 1; }
+    fac_edg = (int*)malloc(3 * N2 * sizeof(int));
+    for (int i = 0; i < N2; i++) {
+        fscanf(fp, "%d %d %d", &fac_edg[3 * i], &fac_edg[3 * i + 1], &fac_edg[3 * i + 2]);
+        for (int a = 0; a < 3; a++) fac_edg[3 * i + a] -= 1;
+    }
+    fclose(fp);
+
+    // ele_fac.txt
+    fp = fopen("C:/Users/owner/source/repos/333333/ele_fac.txt", "r");
+    if (!fp) { perror("ele_fac.txt"); return 1; }
+    int N3_check2;
+    if (fscanf(fp, "%d", &N3_check2) != 1 || N3_check2 != N3) {
+        fprintf(stderr, "Element count mismatch!\n"); fclose(fp); return 1;
+    }
+    ele_fac = (int*)malloc(4 * N3 * sizeof(int));
+    for (int k = 0; k < N3; k++) {
+        fscanf(fp, "%d %d %d %d", &ele_fac[4 * k], &ele_fac[4 * k + 1], &ele_fac[4 * k + 2], &ele_fac[4 * k + 3]);
+        for (int a = 0; a < 4; a++) ele_fac[4 * k + a] -= 1;
+    }
+    fclose(fp);
+
+    // pec_edg.txt
+    fp = fopen("C:/Users/owner/source/repos/333333/pec_edg.txt", "r");
+    if (!fp) { perror("pec_edg.txt"); return 1; }
+    pec_edg_idx = (int*)malloc(MAX_PEC * sizeof(int));
+    int idx;
+    while (fscanf(fp, "%d", &idx) == 1) pec_edg_idx[pec_edg_cnt++] = idx - 1;
+    fclose(fp);
+
+    // pec_fac_idx_set.txt
+    fp = fopen("C:/Users/owner/source/repos/333333/pec_fac_idx_set.txt", "r");
+    if (!fp) { perror("pec_fac_idx_set.txt"); return 1; }
+    pec_fac_idx = (int*)malloc(MAX_PEC * sizeof(int));
+    while (fscanf(fp, "%d", &idx) == 1) pec_fac_idx[pec_fac_cnt++] = idx - 1;
+    fclose(fp);
+
+    // ---- [1] Eps mass matrix (Whitney 1-form, edge basis) ----
+    SparseEntry* S_eps = (SparseEntry*)malloc(MAX_NNZ * sizeof(SparseEntry));
+    int nnz_eps = 0;
+    for (int elem = 0; elem < N3; elem++) {
+        int* nodes = &ele_nod[4 * elem];
+        double Xmat[4][4], invX[4][4], det;
+        for (int i = 0; i < 4; i++) {
+            Xmat[0][i] = nod_crdn[3 * nodes[i] + 0];
+            Xmat[1][i] = nod_crdn[3 * nodes[i] + 1];
+            Xmat[2][i] = nod_crdn[3 * nodes[i] + 2];
+            Xmat[3][i] = 1.0;
+        }
+        det_inv_4x4(Xmat, &det, invX);
+        double vol = fabs(det) / 6.0;
+
+        // grad(lambda_i): 4개 벡터 준비
+        double vec_1[3], vec_2[3], vec_3[3], vec_4[3];
+        for (int d = 0; d < 3; d++) {
+            vec_1[d] = invX[0][d];
+            vec_2[d] = invX[1][d];
+            vec_3[d] = invX[2][d];
+            vec_4[d] = invX[3][d];
+        }
+        double scale = 6.0 * vol / 120.0 * eps0;
+
+        double locM[6][6];
+        locM[0][0] = (2 * dot3(vec_2, vec_2) - dot3(vec_2, vec_1) - dot3(vec_1, vec_2) + 2 * dot3(vec_1, vec_1)) * scale;
+        locM[0][1] = (2 * dot3(vec_2, vec_3) - dot3(vec_2, vec_1) - dot3(vec_1, vec_3) + dot3(vec_1, vec_1)) * scale;
+        locM[0][2] = (2 * dot3(vec_2, vec_4) - dot3(vec_2, vec_1) - dot3(vec_1, vec_4) + dot3(vec_1, vec_1)) * scale;
+        locM[0][3] = (dot3(vec_2, vec_3) - dot3(vec_2, vec_2) - 2 * dot3(vec_1, vec_3) + dot3(vec_1, vec_2)) * scale;
+        locM[0][4] = (dot3(vec_2, vec_4) - dot3(vec_2, vec_2) - 2 * dot3(vec_1, vec_4) + dot3(vec_1, vec_2)) * scale;
+        locM[0][5] = (dot3(vec_2, vec_4) - dot3(vec_2, vec_3) - dot3(vec_1, vec_4) + dot3(vec_1, vec_3)) * scale;
+
+        locM[1][0] = locM[0][1];
+        locM[1][1] = (2 * dot3(vec_3, vec_3) - dot3(vec_3, vec_1) - dot3(vec_1, vec_3) + 2 * dot3(vec_1, vec_1)) * scale;
+        locM[1][2] = (2 * dot3(vec_3, vec_4) - dot3(vec_3, vec_1) - dot3(vec_1, vec_4) + dot3(vec_1, vec_1)) * scale;
+        locM[1][3] = (dot3(vec_3, vec_3) - dot3(vec_3, vec_2) - dot3(vec_1, vec_3) + 2 * dot3(vec_1, vec_2)) * scale;
+        locM[1][4] = (dot3(vec_3, vec_4) - dot3(vec_3, vec_2) - dot3(vec_1, vec_4) + 2 * dot3(vec_1, vec_2)) * scale;
+        locM[1][5] = (dot3(vec_3, vec_4) - dot3(vec_3, vec_3) - 2 * dot3(vec_1, vec_4) + dot3(vec_1, vec_3)) * scale;
+
+        locM[2][0] = locM[0][2];
+        locM[2][1] = locM[1][2];
+        locM[2][2] = (2 * dot3(vec_4, vec_4) - dot3(vec_4, vec_1) - dot3(vec_1, vec_4) + 2 * dot3(vec_1, vec_1)) * scale;
+        locM[2][3] = (dot3(vec_4, vec_3) - dot3(vec_4, vec_2) - dot3(vec_1, vec_3) + dot3(vec_1, vec_2)) * scale;
+        locM[2][4] = (dot3(vec_4, vec_4) - dot3(vec_4, vec_2) - dot3(vec_1, vec_4) + 2 * dot3(vec_1, vec_2)) * scale;
+        locM[2][5] = (dot3(vec_4, vec_4) - dot3(vec_4, vec_3) - dot3(vec_1, vec_4) + 2 * dot3(vec_1, vec_3)) * scale;
+
+        locM[3][0] = locM[0][3];
+        locM[3][1] = locM[1][3];
+        locM[3][2] = locM[2][3];
+        locM[3][3] = (2 * dot3(vec_3, vec_3) - dot3(vec_3, vec_2) - dot3(vec_2, vec_3) + 2 * dot3(vec_2, vec_2)) * scale;
+        locM[3][4] = (2 * dot3(vec_3, vec_4) - dot3(vec_3, vec_2) - dot3(vec_2, vec_4) + dot3(vec_2, vec_2)) * scale;
+        locM[3][5] = (dot3(vec_3, vec_4) - dot3(vec_3, vec_3) - 2 * dot3(vec_2, vec_4) + dot3(vec_2, vec_3)) * scale;
+
+        locM[4][0] = locM[0][4];
+        locM[4][1] = locM[1][4];
+        locM[4][2] = locM[2][4];
+        locM[4][3] = locM[3][4];
+        locM[4][4] = (2 * dot3(vec_4, vec_4) - dot3(vec_4, vec_2) - dot3(vec_2, vec_4) + 2 * dot3(vec_2, vec_2)) * scale;
+        locM[4][5] = (dot3(vec_4, vec_4) - dot3(vec_4, vec_3) - dot3(vec_2, vec_4) + 2 * dot3(vec_2, vec_3)) * scale;
+
+        locM[5][0] = locM[0][5];
+        locM[5][1] = locM[1][5];
+        locM[5][2] = locM[2][5];
+        locM[5][3] = locM[3][5];
+        locM[5][4] = locM[4][5];
+        locM[5][5] = (2 * dot3(vec_4, vec_4) - dot3(vec_4, vec_3) - dot3(vec_3, vec_4) + 2 * dot3(vec_3, vec_3)) * scale;
+
+        for (int a = 0; a < 6; a++) {
+            int global_i = ele_edg[6 * elem + a];
+            if (is_PEC_edge(global_i, pec_edg_idx, pec_edg_cnt)) continue;
+            for (int b = 0; b < 6; b++) {
+                int global_j = ele_edg[6 * elem + b];
+                if (is_PEC_edge(global_j, pec_edg_idx, pec_edg_cnt)) continue;
+                add_sparse(S_eps, &nnz_eps, global_i, global_j, locM[a][b]);
+            }
+        }
+    }
+
+    // 인덱스 재정렬
+    int* map_old2new_eps = (int*)malloc(N1 * sizeof(int));
+    int new_idx_eps = 0;
+    for (int i = 0; i < N1; i++)
+        map_old2new_eps[i] = is_PEC_edge(i, pec_edg_idx, pec_edg_cnt) ? -1 : new_idx_eps++;
+    int N1_new = new_idx_eps;
+
+    SparseEntry* S_new_eps = (SparseEntry*)malloc(MAX_NNZ * sizeof(SparseEntry));
+    int nnz_new_eps = 0;
+    for (int k = 0; k < nnz_eps; k++) {
+        int r = map_old2new_eps[S_eps[k].row];
+        int c = map_old2new_eps[S_eps[k].col];
+        if (r == -1 || c == -1) continue;
+        S_new_eps[nnz_new_eps].row = r;
+        S_new_eps[nnz_new_eps].col = c;
+        S_new_eps[nnz_new_eps].value = S_eps[k].value;
+        nnz_new_eps++;
+    }
+
+    // ---- [2] Mu inverse mass matrix (Whitney 2-form, face basis) ----
+    SparseEntry* S_mu = (SparseEntry*)malloc(MAX_NNZ * sizeof(SparseEntry));
+    int nnz_mu = 0;
+    for (int elem = 0; elem < N3; elem++) {
+        int* nodes = &ele_nod[4 * elem];
+        double Xmat[4][4], invX[4][4], det;
+        for (int i = 0; i < 4; i++) {
+            Xmat[0][i] = nod_crdn[3 * nodes[i] + 0];
+            Xmat[1][i] = nod_crdn[3 * nodes[i] + 1];
+            Xmat[2][i] = nod_crdn[3 * nodes[i] + 2];
+            Xmat[3][i] = 1.0;
+        }
+        det_inv_4x4(Xmat, &det, invX);
+        double vol = fabs(det) / 6.0;
+        double scale = 6.0 * vol / 120.0 / mu0 * 4.0;
+
+        double grad[4][3];
+        for (int i = 0; i < 4; i++)
+            for (int d = 0; d < 3; d++)
+                grad[i][d] = invX[i][d];
+
+        double cross_gg_lambda[4][4][3];
+        for (int ii = 0; ii < 4; ii++)
+            for (int jj = 0; jj < 4; jj++)
+                cross3(grad[ii], grad[jj], cross_gg_lambda[ii][jj]);
+
+        double vec_23[3], vec_31[3], vec_12[3], vec_24[3], vec_41[3], vec_34[3], vec_13[3], vec_42[3];
+        for (int d = 0; d < 3; d++) {
+            vec_23[d] = cross_gg_lambda[1][2][d];
+            vec_31[d] = cross_gg_lambda[2][0][d];
+            vec_12[d] = cross_gg_lambda[0][1][d];
+            vec_24[d] = cross_gg_lambda[1][3][d];
+            vec_41[d] = cross_gg_lambda[3][0][d];
+            vec_34[d] = cross_gg_lambda[2][3][d];
+            vec_13[d] = cross_gg_lambda[0][2][d];
+            vec_42[d] = cross_gg_lambda[3][1][d];
+        }
+
+        double loc_mu_inv[4][4] = { 0 };
+        loc_mu_inv[0][0] = 2 * dot3(vec_23, vec_23) + dot3(vec_23, vec_31) + dot3(vec_23, vec_12) + dot3(vec_31, vec_23) + 2 * dot3(vec_31, vec_31) + dot3(vec_31, vec_12) + dot3(vec_12, vec_23) + dot3(vec_12, vec_31) + 2 * dot3(vec_12, vec_12);
+        loc_mu_inv[0][1] = 2 * dot3(vec_23, vec_24) + dot3(vec_23, vec_41) + dot3(vec_23, vec_12) + dot3(vec_31, vec_24) + 2 * dot3(vec_31, vec_41) + dot3(vec_31, vec_12) + dot3(vec_12, vec_24) + dot3(vec_12, vec_41) + dot3(vec_12, vec_12);
+        loc_mu_inv[0][2] = 2 * dot3(vec_23, vec_34) + dot3(vec_23, vec_41) + dot3(vec_23, vec_13) + dot3(vec_31, vec_34) + dot3(vec_31, vec_41) + dot3(vec_31, vec_13) + dot3(vec_12, vec_34) + 2 * dot3(vec_12, vec_41) + dot3(vec_12, vec_13);
+        loc_mu_inv[0][3] = dot3(vec_23, vec_34) + dot3(vec_23, vec_42) + dot3(vec_23, vec_23) + 2 * dot3(vec_31, vec_34) + dot3(vec_31, vec_42) + dot3(vec_31, vec_23) + dot3(vec_12, vec_34) + 2 * dot3(vec_12, vec_42) + dot3(vec_12, vec_23);
+        loc_mu_inv[1][0] = loc_mu_inv[0][1];
+        loc_mu_inv[1][1] = 2 * dot3(vec_24, vec_24) + dot3(vec_24, vec_41) + dot3(vec_24, vec_12) + dot3(vec_41, vec_24) + 2 * dot3(vec_41, vec_41) + dot3(vec_41, vec_12) + dot3(vec_12, vec_24) + dot3(vec_12, vec_41) + 2 * dot3(vec_12, vec_12);
+        loc_mu_inv[1][2] = 2 * dot3(vec_24, vec_34) + dot3(vec_24, vec_41) + dot3(vec_24, vec_13) + dot3(vec_41, vec_34) + dot3(vec_41, vec_41) + dot3(vec_41, vec_13) + dot3(vec_12, vec_34) + dot3(vec_12, vec_41) + 2 * dot3(vec_12, vec_13);
+        loc_mu_inv[1][3] = dot3(vec_24, vec_34) + dot3(vec_24, vec_42) + dot3(vec_24, vec_23) + 2 * dot3(vec_41, vec_34) + dot3(vec_41, vec_42) + dot3(vec_41, vec_23) + dot3(vec_12, vec_34) + dot3(vec_12, vec_42) + 2 * dot3(vec_12, vec_23);
+        loc_mu_inv[2][0] = loc_mu_inv[0][2];
+        loc_mu_inv[2][1] = loc_mu_inv[1][2];
+        loc_mu_inv[2][2] = 2 * dot3(vec_34, vec_34) + dot3(vec_34, vec_41) + dot3(vec_34, vec_13) + dot3(vec_41, vec_34) + 2 * dot3(vec_41, vec_41) + dot3(vec_41, vec_13) + dot3(vec_13, vec_34) + dot3(vec_13, vec_41) + 2 * dot3(vec_13, vec_13);
+        loc_mu_inv[2][3] = dot3(vec_34, vec_34) + dot3(vec_34, vec_42) + dot3(vec_34, vec_23) + dot3(vec_41, vec_34) + 2 * dot3(vec_41, vec_42) + dot3(vec_41, vec_23) + dot3(vec_13, vec_34) + dot3(vec_13, vec_42) + 2 * dot3(vec_13, vec_23);
+        loc_mu_inv[3][0] = loc_mu_inv[0][3];
+        loc_mu_inv[3][1] = loc_mu_inv[1][3];
+        loc_mu_inv[3][2] = loc_mu_inv[2][3];
+        loc_mu_inv[3][3] = 2 * dot3(vec_34, vec_34) + dot3(vec_34, vec_42) + dot3(vec_34, vec_23) + dot3(vec_42, vec_34) + 2 * dot3(vec_42, vec_42) + dot3(vec_42, vec_23) + dot3(vec_23, vec_34) + dot3(vec_23, vec_42) + 2 * dot3(vec_23, vec_23);
+
+        for (int a = 0; a < 4; a++) {
+            int global_i = ele_fac[4 * elem + a];
+            if (is_PEC_face(global_i, pec_fac_idx, pec_fac_cnt)) continue;
+            for (int b = 0; b < 4; b++) {
+                int global_j = ele_fac[4 * elem + b];
+                if (is_PEC_face(global_j, pec_fac_idx, pec_fac_cnt)) continue;
+                add_sparse(S_mu, &nnz_mu, global_i, global_j, loc_mu_inv[a][b] * scale);
+            }
+        }
+    }
+
+    // 인덱스 재정렬
+    int* map_old2new_mu = (int*)malloc(N2 * sizeof(int));
+    int new_idx_mu = 0;
+    for (int i = 0; i < N2; i++)
+        map_old2new_mu[i] = is_PEC_face(i, pec_fac_idx, pec_fac_cnt) ? -1 : new_idx_mu++;
+    int N2_new = new_idx_mu;
+
+    SparseEntry* S_new_mu = (SparseEntry*)malloc(MAX_NNZ * sizeof(SparseEntry));
+    int nnz_new_mu = 0;
+    for (int k = 0; k < nnz_mu; k++) {
+        int r = map_old2new_mu[S_mu[k].row];
+        int c = map_old2new_mu[S_mu[k].col];
+        if (r == -1 || c == -1) continue;
+        S_new_mu[nnz_new_mu].row = r;
+        S_new_mu[nnz_new_mu].col = c;
+        S_new_mu[nnz_new_mu].value = S_mu[k].value;
+        nnz_new_mu++;
+    }
+
+    int eps_blk = (N1_new < 5) ? N1_new : 5;
+    int nnz_eps_blk = 0;
+    for (int k = 0; k < nnz_new_eps; k++)
+        if (S_new_eps[k].row < eps_blk && S_new_eps[k].col < eps_blk)
+            nnz_eps_blk++;
+    SparseEntry* coo_eps_blk = (SparseEntry*)malloc(nnz_eps_blk * sizeof(SparseEntry));
+    int idx_eps = 0;
+    for (int k = 0; k < nnz_new_eps; k++)
+        if (S_new_eps[k].row < eps_blk && S_new_eps[k].col < eps_blk)
+            coo_eps_blk[idx_eps++] = S_new_eps[k];
+
+    double* values_eps; int* col_indices_eps; int* row_ptr_eps;
+    coo_to_csr(coo_eps_blk, nnz_eps_blk, eps_blk, eps_blk, &values_eps, &col_indices_eps, &row_ptr_eps);
+    printf("\n=== eps_mass 5x5 CSR ===\n");
+    print_csr(values_eps, col_indices_eps, row_ptr_eps, eps_blk, nnz_eps_blk);
+
+    // ---- mu_inv_mass 5x5 부분을 CSR로 변환 및 출력 ----
+    int mu_blk = (N2_new < 5) ? N2_new : 5;
+    int nnz_mu_blk = 0;
+    for (int k = 0; k < nnz_new_mu; k++)
+        if (S_new_mu[k].row < mu_blk && S_new_mu[k].col < mu_blk)
+            nnz_mu_blk++;
+    SparseEntry* coo_mu_blk = (SparseEntry*)malloc(nnz_mu_blk * sizeof(SparseEntry));
+    int idx_mu = 0;
+    for (int k = 0; k < nnz_new_mu; k++)
+        if (S_new_mu[k].row < mu_blk && S_new_mu[k].col < mu_blk)
+            coo_mu_blk[idx_mu++] = S_new_mu[k];
+
+    double* values_mu; int* col_indices_mu; int* row_ptr_mu;
+    coo_to_csr(coo_mu_blk, nnz_mu_blk, mu_blk, mu_blk, &values_mu, &col_indices_mu, &row_ptr_mu);
+    printf("\n=== mu_inv_mass 5x5 CSR ===\n");
+    print_csr(values_mu, col_indices_mu, row_ptr_mu, mu_blk, nnz_mu_blk);
+
+    // ---- 메모리 해제 ----
+    free(values_eps); free(col_indices_eps); free(row_ptr_eps); free(coo_eps_blk);
+    free(values_mu); free(col_indices_mu); free(row_ptr_mu); free(coo_mu_blk);
+
+    // ---- 메모리 해제 ----
+    free(nod_crdn); free(ele_nod); free(ele_edg); free(edg_nod); free(fac_edg); free(ele_fac);
+    free(pec_edg_idx); free(pec_fac_idx);
+    free(S_eps); free(S_new_eps); free(map_old2new_eps);
+    free(S_mu); free(S_new_mu); free(map_old2new_mu);
+
+    return 0;
+}
