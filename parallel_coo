@@ -1,0 +1,301 @@
+// parallel_all_coo.cu
+#define _CRT_SECURE_NO_WARNINGS
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <string.h>
+#include <omp.h>
+#include <cuda_runtime.h>
+
+#define MAX_NNZ 30000000
+#define MAX_PEC 5000000
+
+static const double PI = 3.14159265358979323846;
+static const double eps0 = 1.0 / (36.0 * PI) * 1e-9;
+
+typedef struct {
+    int row, col;
+    float value;  // value를 float로 변경
+} SparseEntry;
+
+static inline double dot3(const double* a, const double* b) {
+    return a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+}
+
+static void det_inv_4x4(const double X[4][4], double* det_out, double invX[4][4]) {
+    double A[4][8];
+    for (int i = 0; i < 4; i++) {
+        memcpy(A[i], X[i], 4*sizeof(double));
+        for (int j = 0; j < 4; j++) A[i][j+4] = (i==j) ? 1.0 : 0.0;
+    }
+    double det = 1.0;
+    for (int i = 0; i < 4; i++) {
+        int piv = i;
+        for (int r = i+1; r < 4; r++)
+            if (fabs(A[r][i]) > fabs(A[piv][i])) piv = r;
+        if (piv != i) {
+            for (int c = 0; c < 8; c++) { double tmp = A[i][c]; A[i][c]=A[piv][c]; A[piv][c]=tmp; }
+            det = -det;
+        }
+        double d = A[i][i];
+        if (fabs(d) < 1e-16) { fprintf(stderr, "Singular matrix\n"); exit(EXIT_FAILURE); }
+        det *= d;
+        for (int c = 0; c < 8; c++) A[i][c] /= d;
+        for (int r = 0; r < 4; r++) if (r != i) {
+            double f = A[r][i];
+            for (int c = 0; c < 8; c++) A[r][c] -= f * A[i][c];
+        }
+    }
+    *det_out = det;
+    for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) invX[i][j] = A[i][j+4];
+}
+
+int is_PEC_edge(int idx, int* pec_idx, int pec_cnt) {
+    for (int i = 0; i < pec_cnt; i++) if (pec_idx[i] == idx) return 1;
+    return 0;
+}
+
+// thread-safe add_sparse: 선형검색+atomic(안씀), 대신 쓰레드별 S_local 할당
+void add_sparse(SparseEntry* S, int* nnz, int i, int j, float value) {  // value를 float로 변경
+    int idx = *nnz;
+    S[idx].row = i;
+    S[idx].col = j;
+    S[idx].value = value;
+    (*nnz)++;
+}
+
+// CUDA: COO 곱셈 (atomicAdd 필요!)
+// 여기에 double 대신 float을 사용
+__global__ void coo_matvec_cuda(
+    int nnz, const int* row, const int* col, const float* val,
+    const float* x, float* y, int n_row)
+{
+    int tid = blockDim.x * blockIdx.x + threadIdx.x;
+    for (int k = tid; k < nnz; k += gridDim.x * blockDim.x) {
+        int r = row[k], c = col[k];
+        float v = val[k];
+        atomicAdd(&y[r], v * x[c]);
+    }
+}
+
+int main(void) {
+    int N0, N1, N3;
+    double* nod_crdn = NULL;
+    int *ele_nod = NULL, *ele_edg = NULL, *edg_nod = NULL;
+    int *pec_edg_idx = NULL;
+    int pec_edg_cnt = 0;
+
+    // 파일 읽기
+    FILE* fp = fopen("nod_crdn.txt", "r");
+    if (!fp) { perror("nod_crdn.txt"); return 1; }
+    fscanf(fp, "%d", &N0);
+    nod_crdn = (double*)malloc(3 * N0 * sizeof(double));
+    for (int i = 0; i < N0; i++) fscanf(fp, "%lf %lf %lf", &nod_crdn[3 * i], &nod_crdn[3 * i + 1], &nod_crdn[3 * i + 2]);
+    fclose(fp);
+
+    fp = fopen("edg_nod.txt", "r");
+    if (!fp) { perror("edg_nod.txt"); return 1; }
+    fscanf(fp, "%d", &N1);
+    edg_nod = (int*)malloc(2 * N1 * sizeof(int));
+    for (int i = 0; i < N1; i++) { fscanf(fp, "%d %d", &edg_nod[2 * i], &edg_nod[2 * i + 1]); edg_nod[2 * i]--; edg_nod[2 * i + 1]--; }
+    fclose(fp);
+
+    fp = fopen("ele_edg.txt", "r");
+    if (!fp) { perror("ele_edg.txt"); return 1; }
+    fscanf(fp, "%d", &N3);
+    ele_edg = (int*)malloc(6 * N3 * sizeof(int));
+    for (int k = 0; k < N3; k++) {
+        fscanf(fp, "%d %d %d %d %d %d",
+            &ele_edg[6 * k], &ele_edg[6 * k + 1], &ele_edg[6 * k + 2],
+            &ele_edg[6 * k + 3], &ele_edg[6 * k + 4], &ele_edg[6 * k + 5]);
+        for (int a = 0; a < 6; a++) ele_edg[6 * k + a]--;
+    }
+    fclose(fp);
+
+    fp = fopen("ele_nod.txt", "r");
+    if (!fp) { perror("ele_nod.txt"); return 1; }
+    int N3_check;
+    fscanf(fp, "%d", &N3_check);
+    ele_nod = (int*)malloc(4 * N3 * sizeof(int));
+    for (int k = 0; k < N3; k++) {
+        fscanf(fp, "%d %d %d %d", &ele_nod[4 * k], &ele_nod[4 * k + 1], &ele_nod[4 * k + 2], &ele_nod[4 * k + 3]);
+        for (int a = 0; a < 4; a++) ele_nod[4 * k + a]--;
+    }
+    fclose(fp);
+
+    fp = fopen("pec_edg_idx_set.txt", "r");
+    if (!fp) { perror("pec_edg_idx_set.txt"); return 1; }
+    pec_edg_idx = (int*)malloc(MAX_PEC * sizeof(int));
+    int idx;
+    while (fscanf(fp, "%d", &idx) == 1) pec_edg_idx[pec_edg_cnt++] = idx - 1;
+    fclose(fp);
+
+    SparseEntry* S_eps = (SparseEntry*)malloc(MAX_NNZ * sizeof(SparseEntry));
+
+    int nthreads = omp_get_max_threads();
+    SparseEntry** S_local = (SparseEntry**)malloc(nthreads * sizeof(SparseEntry*));
+    int* nnz_local = (int*)calloc(nthreads, sizeof(int));
+    for (int t = 0; t < nthreads; t++) S_local[t] = (SparseEntry*)malloc((MAX_NNZ / nthreads) * sizeof(SparseEntry));
+
+    #pragma omp parallel
+    {
+        int tid = omp_get_thread_num();
+        int local_nnz = 0;
+        #pragma omp for schedule(static)
+        for (int elem = 0; elem < N3; elem++) {
+            int* nodes = &ele_nod[4 * elem];
+            double Xmat[4][4], invX[4][4], det;
+            for (int i = 0; i < 4; i++) {
+                Xmat[0][i] = nod_crdn[3 * nodes[i]];
+                Xmat[1][i] = nod_crdn[3 * nodes[i] + 1];
+                Xmat[2][i] = nod_crdn[3 * nodes[i] + 2];
+                Xmat[3][i] = 1.0;
+            }
+            det_inv_4x4(Xmat, &det, invX);
+            double vol = fabs(det) / 6.0;
+            double vec_1[3], vec_2[3], vec_3[3], vec_4[3];
+            for (int d = 0; d < 3; d++) {
+                vec_1[d] = invX[0][d]; vec_2[d] = invX[1][d];
+                vec_3[d] = invX[2][d]; vec_4[d] = invX[3][d];
+            }
+            double scale = 6.0 * vol / 120.0 * eps0;
+            double locM[6][6];
+            locM[0][0] = (2 * dot3(vec_2, vec_2) - dot3(vec_2, vec_1) - dot3(vec_1, vec_2) + 2 * dot3(vec_1, vec_1)) * scale;
+            locM[0][1] = (2 * dot3(vec_2, vec_3) - dot3(vec_2, vec_1) - dot3(vec_1, vec_3) + dot3(vec_1, vec_1)) * scale;
+            locM[0][2] = (2 * dot3(vec_2, vec_4) - dot3(vec_2, vec_1) - dot3(vec_1, vec_4) + dot3(vec_1, vec_1)) * scale;
+            locM[0][3] = (dot3(vec_2, vec_3) - dot3(vec_2, vec_2) - 2 * dot3(vec_1, vec_3) + dot3(vec_1, vec_2)) * scale;
+            locM[0][4] = (dot3(vec_2, vec_4) - dot3(vec_2, vec_2) - 2 * dot3(vec_1, vec_4) + dot3(vec_1, vec_2)) * scale;
+            locM[0][5] = (dot3(vec_2, vec_4) - dot3(vec_2, vec_3) - dot3(vec_1, vec_4) + dot3(vec_1, vec_3)) * scale;
+
+            locM[1][0] = locM[0][1];
+            locM[1][1] = (2 * dot3(vec_3, vec_3) - dot3(vec_3, vec_1) - dot3(vec_1, vec_3) + 2 * dot3(vec_1, vec_1)) * scale;
+            locM[1][2] = (2 * dot3(vec_3, vec_4) - dot3(vec_3, vec_1) - dot3(vec_1, vec_4) + dot3(vec_1, vec_1)) * scale;
+            locM[1][3] = (dot3(vec_3, vec_3) - dot3(vec_3, vec_2) - dot3(vec_1, vec_3) + 2 * dot3(vec_1, vec_2)) * scale;
+            locM[1][4] = (dot3(vec_3, vec_4) - dot3(vec_3, vec_2) - dot3(vec_1, vec_4) + 2 * dot3(vec_1, vec_2)) * scale;
+            locM[1][5] = (dot3(vec_3, vec_4) - dot3(vec_3, vec_3) - 2 * dot3(vec_1, vec_4) + dot3(vec_1, vec_3)) * scale;
+
+            locM[2][0] = locM[0][2];
+            locM[2][1] = locM[1][2];
+            locM[2][2] = (2 * dot3(vec_4, vec_4) - dot3(vec_4, vec_1) - dot3(vec_1, vec_4) + 2 * dot3(vec_1, vec_1)) * scale;
+            locM[2][3] = (dot3(vec_4, vec_3) - dot3(vec_4, vec_2) - dot3(vec_1, vec_3) + dot3(vec_1, vec_2)) * scale;
+            locM[2][4] = (dot3(vec_4, vec_4) - dot3(vec_4, vec_2) - dot3(vec_1, vec_4) + 2 * dot3(vec_1, vec_2)) * scale;
+            locM[2][5] = (dot3(vec_4, vec_4) - dot3(vec_4, vec_3) - dot3(vec_1, vec_4) + 2 * dot3(vec_1, vec_3)) * scale;
+
+            locM[3][0] = locM[0][3];
+            locM[3][1] = locM[1][3];
+            locM[3][2] = locM[2][3];
+            locM[3][3] = (2 * dot3(vec_3, vec_3) - dot3(vec_3, vec_2) - dot3(vec_2, vec_3) + 2 * dot3(vec_2, vec_2)) * scale;
+            locM[3][4] = (2 * dot3(vec_3, vec_4) - dot3(vec_3, vec_2) - dot3(vec_2, vec_4) + dot3(vec_2, vec_2)) * scale;
+            locM[3][5] = (dot3(vec_3, vec_4) - dot3(vec_3, vec_3) - 2 * dot3(vec_2, vec_4) + dot3(vec_2, vec_3)) * scale;
+
+            locM[4][0] = locM[0][4];
+            locM[4][1] = locM[1][4];
+            locM[4][2] = locM[2][4];
+            locM[4][3] = locM[3][4];
+            locM[4][4] = (2 * dot3(vec_4, vec_4) - dot3(vec_4, vec_2) - dot3(vec_2, vec_4) + 2 * dot3(vec_2, vec_2)) * scale;
+            locM[4][5] = (dot3(vec_4, vec_4) - dot3(vec_4, vec_3) - dot3(vec_2, vec_4) + 2 * dot3(vec_2, vec_3)) * scale;
+            locM[5][0] = locM[0][5];
+            locM[5][1] = locM[1][5];
+            locM[5][2] = locM[2][5];
+            locM[5][3] = locM[3][5];
+            locM[5][4] = locM[4][5];
+            locM[5][5] = (2 * dot3(vec_4, vec_4) - dot3(vec_4, vec_3) - dot3(vec_3, vec_4) + 2 * dot3(vec_3, vec_3)) * scale;
+
+            for (int a = 0; a < 6; a++) {
+                int global_i = ele_edg[6 * elem + a];
+                if (is_PEC_edge(global_i, pec_edg_idx, pec_edg_cnt)) continue;
+                for (int b = 0; b < 6; b++) {
+                    int global_j = ele_edg[6 * elem + b];
+                    if (is_PEC_edge(global_j, pec_edg_idx, pec_edg_cnt)) continue;
+                    add_sparse(S_local[tid], &local_nnz, global_i, global_j, locM[a][b]);
+                }
+            }
+        }
+        nnz_local[tid] = local_nnz;
+    }
+
+    int offset = 0;
+    for (int t = 0; t < nthreads; t++) {
+        memcpy(S_eps + offset, S_local[t], nnz_local[t] * sizeof(SparseEntry));
+        offset += nnz_local[t];
+        free(S_local[t]);
+    }
+    int nnz_eps = offset;
+    free(S_local);
+    free(nnz_local);
+
+    int* map_old2new = (int*)malloc(N1 * sizeof(int));
+    int new_idx = 0;
+    for (int i = 0; i < N1; i++) map_old2new[i] = is_PEC_edge(i, pec_edg_idx, pec_edg_cnt) ? -1 : new_idx++;
+    int N1_new = new_idx;
+
+    SparseEntry* S_new = (SparseEntry*)malloc(MAX_NNZ * sizeof(SparseEntry));
+    int nnz_new = 0;
+    #pragma omp parallel for
+    for (int k = 0; k < nnz_eps; k++) {
+        int r = map_old2new[S_eps[k].row];
+        int c = map_old2new[S_eps[k].col];
+        if (r == -1 || c == -1) continue;
+        S_new[__sync_fetch_and_add(&nnz_new, 1)].row = r;
+        S_new[nnz_new - 1].col = c;
+        S_new[nnz_new - 1].value = S_eps[k].value;
+    }
+
+    // COO 연산 준비
+    int n_row = N1_new, n_col = N1_new;
+    float* x = (float*)malloc(n_col * sizeof(float));
+    for (int i = 0; i < n_col; i++) x[i] = 1.0;
+    float* y = (float*)calloc(n_row, sizeof(float));
+
+    // COO 배열로 복사
+    int* coo_row = (int*)malloc(nnz_new * sizeof(int));
+    int* coo_col = (int*)malloc(nnz_new * sizeof(int));
+    float* coo_val = (float*)malloc(nnz_new * sizeof(float));
+    for (int i = 0; i < nnz_new; i++) {
+        coo_row[i] = S_new[i].row;
+        coo_col[i] = S_new[i].col;
+        coo_val[i] = S_new[i].value;
+    }
+
+    // CUDA 메모리 할당 및 복사
+    int *d_coo_row, *d_coo_col;
+    float *d_coo_val, *d_coo_x, *d_coo_y;
+    cudaMalloc((void**)&d_coo_row, nnz_new * sizeof(int));
+    cudaMalloc((void**)&d_coo_col, nnz_new * sizeof(int));
+    cudaMalloc((void**)&d_coo_val, nnz_new * sizeof(float)); // float으로 변경
+    cudaMalloc((void**)&d_coo_x, n_col * sizeof(float)); // float으로 변경
+    cudaMalloc((void**)&d_coo_y, n_row * sizeof(float)); // float으로 변경
+    cudaMemcpy(d_coo_row, coo_row, nnz_new * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_coo_col, coo_col, nnz_new * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_coo_val, coo_val, nnz_new * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_coo_x, x, n_col * sizeof(float), cudaMemcpyHostToDevice);
+
+    int blockSize = 256, gridSize = (n_row + blockSize - 1) / blockSize;
+
+    cudaMemset(d_coo_y, 0, n_row * sizeof(float));
+    cudaEvent_t start2, stop2;
+    cudaEventCreate(&start2); cudaEventCreate(&stop2);
+    cudaEventRecord(start2);
+
+    int N_REPEAT = 100000;
+    for (int t = 0; t < N_REPEAT; t++) {
+        cudaMemset(d_coo_y, 0, n_row * sizeof(float)); // 초기화 중요!
+        coo_matvec_cuda<<<gridSize, blockSize>>>(nnz_new, d_coo_row, d_coo_col, d_coo_val, d_coo_x, d_coo_y, n_row);
+    }
+
+    cudaEventRecord(stop2); cudaEventSynchronize(stop2);
+    float msec2 = 0;
+    cudaEventElapsedTime(&msec2, start2, stop2);
+
+    cudaMemcpy(y, d_coo_y, n_row * sizeof(float), cudaMemcpyDeviceToHost);
+
+    printf("GPU COO mat-vec 1회 평균 시간 (100000번 반복): %.6f초\n", (msec2 / 1000.0) / N_REPEAT);
+
+    // 메모리 해제
+    cudaFree(d_coo_row); cudaFree(d_coo_col); cudaFree(d_coo_val); cudaFree(d_coo_x); cudaFree(d_coo_y);
+    free(x); free(y);
+    free(coo_row); free(coo_col); free(coo_val);
+    free(S_eps); free(S_new); free(map_old2new); free(nod_crdn); free(ele_nod); free(ele_edg); free(edg_nod); free(pec_edg_idx);
+
+    return 0;
+}
