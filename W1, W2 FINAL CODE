@@ -3,8 +3,8 @@
 #include <stdlib.h>
 #include <math.h>
 #include <string.h>
-#include <omp.h>  // OpenMP 헤더 파일 추가
-#include <chrono> // chrono 헤더 추가
+#include <omp.h>  
+#include <chrono> 
 #define MAX_NNZ 3000000
 #define MAX_PEC 50000
 #include <iostream>
@@ -55,24 +55,21 @@ static void det_inv_4x4(const double X[4][4], double* det_out, double invX[4][4]
     for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) invX[i][j] = A[i][j + 4];
 }
 
+
 void add_sparse(SparseEntry* S, int* nnz, int i, int j, double value) {
-    int found = 0;
-    // 기존에 값이 존재하면 덧셈
     for (int idx = 0; idx < *nnz; idx++) {
         if (S[idx].row == i && S[idx].col == j) {
             S[idx].value += value;
-            found = 1;
-            break;
+            return;
         }
     }
-    // 값이 없으면 새로운 항목 추가
-    if (!found && *nnz < MAX_NNZ) {
+    if (*nnz < MAX_NNZ) {
         S[*nnz].row = i;
         S[*nnz].col = j;
         S[*nnz].value = value;
         (*nnz)++;
     }
-    else if (!found) {
+    else {
         printf("Sparse array overflow!\n");
         exit(1);
     }
@@ -102,9 +99,6 @@ int is_PEC_face(int idx, int* pec_idx, int pec_cnt) {
         if (pec_idx[i] == idx) return 1;
     }
     return 0;
-}
-static void det_inv_4x4(const double X[4][4], double* det_out, double invX[4][4]) {
-    // Your det_inv_4x4 function implementation
 }
 
 int main(void) {
@@ -290,14 +284,17 @@ int main(void) {
     double elapsed_matrix = std::chrono::duration<double>(end_matrix - start_matrix).count();
     printf("[Eps mass matrix 생성] Elapsed time: %.3f sec\n", elapsed_matrix);
 
-    // ------------------- Mapping 시간 측정 -------------------
-    auto start_mapping = std::chrono::high_resolution_clock::now();
+   
+    int* map_old2new = (int*)malloc(N1 * sizeof(int));
+    int new_idx = 0;
+    for (int i = 0; i < N1; i++) {
+        if (is_PEC_edge(i, pec_edg_idx, pec_edg_cnt))
+            map_old2new[i] = -1;
+        else
+            map_old2new[i] = new_idx++;
+    }
+    int N1_new = new_idx;
 
-    int* map_old2new_eps = (int*)malloc(N1 * sizeof(int));
-    int new_idx_eps = 0;
-    for (int i = 0; i < N1; i++)
-        map_old2new_eps[i] = is_PEC_edge(i, pec_edg_idx, pec_edg_cnt) ? -1 : new_idx_eps++;
-    int N1_new = new_idx_eps;
 
     SparseEntry* S_new_eps = (SparseEntry*)malloc(MAX_NNZ * sizeof(SparseEntry));
     int nnz_new_eps = 0;
@@ -308,8 +305,8 @@ int main(void) {
         if (S_eps[k].col < 0 || S_eps[k].col >= N1) {
             continue;
         }
-        int r = map_old2new_eps[S_eps[k].row];
-        int c = map_old2new_eps[S_eps[k].col];
+        int r = map_old2new[S_eps[k].row];
+        int c = map_old2new[S_eps[k].col];
         if (r == -1 || c == -1) continue;
         S_new_eps[nnz_new_eps].row = r;
         S_new_eps[nnz_new_eps].col = c;
@@ -318,9 +315,7 @@ int main(void) {
     }
 
 
-
-
-/*    // ---- [2] Mu inverse mass matrix (Whitney 2-form, face basis) ----
+   // ---- [2] Mu inverse mass matrix (Whitney 2-form, face basis) ----
 #pragma omp parallel for
     for (int elem = 0; elem < N3; elem++) {
         int* nodes = &ele_nod[4 * elem];
@@ -413,6 +408,7 @@ int main(void) {
     for (int i = 0; i < 10 && i < N1_new; i++) {
         for (int j = 0; j < 10 && j < N1_new; j++) {
             double val = 0.0;
+
 #pragma omp parallel for reduction(+:val)
             for (int k = 0; k < nnz_new_eps; k++) {
                 if (S_new_eps[k].row == i && S_new_eps[k].col == j) { val = S_new_eps[k].value; break; }
@@ -423,7 +419,7 @@ int main(void) {
     }
     printf("Nonzero nnz count (PEC edge 제외): %d\n", nnz_new_eps);
 
-/*    printf("\nMu_inverse_mass_sp_mat (Whitney 2-form, 10x10 block, PEC face 제외):\n");
+    printf("\nMu_inverse_mass_sp_mat (Whitney 2-form, 10x10 block, PEC face 제외):\n");
     for (int i = 0; i < 10 && i < N2_new; i++) {
         for (int j = 0; j < 10 && j < N2_new; j++) {
             double val = 0.0;
@@ -441,9 +437,9 @@ int main(void) {
     free(nod_crdn); free(ele_nod); free(ele_edg); free(edg_nod); free(fac_edg); free(ele_fac);
     free(pec_edg_idx); free(pec_fac_idx);
     free(S_eps); free(S_mu);
-    auto end_mapping = std::chrono::high_resolution_clock::now();
-    double elapsed_mapping = std::chrono::duration<double>(end_mapping - start_mapping).count();
-    printf("\n==== 전체 실행 시간(프로그램 시작~끝): %.3f sec ====\n", elapsed_mapping);  // ★ 추가: 출력
+  
+   
+   
 
     return 0;
 }
