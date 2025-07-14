@@ -1,0 +1,326 @@
+#define _CRT_SECURE_NO_WARNINGS
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <string.h>
+#include <cuda_runtime.h>
+
+#define MAX_NNZ 3000000
+#define MAX_PEC 50000
+
+static const double PI = 3.14159265358979323846;
+static const double eps0 = 1.0 / (36.0 * PI) * 1e-9;
+
+// CUDA 에러 체크 매크로
+#define CUDA_CHECK(err) do { if (err != cudaSuccess) { \
+    printf("CUDA error: %s\n", cudaGetErrorString(err)); exit(1); }} while(0)
+
+typedef struct {
+    int row;
+    int col;
+    double value;
+} SparseEntry;
+
+// atomicAdd for double (구형 GPU용)
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 600
+#else
+__device__ double atomicAdd(double* address, double val) {
+    unsigned long long int* address_as_ull = (unsigned long long int*)address;
+    unsigned long long int old = *address_as_ull, assumed;
+    do {
+        assumed = old;
+        old = atomicCAS(address_as_ull, assumed,
+            __double_as_longlong(val + __longlong_as_double(assumed)));
+    } while (assumed != old);
+    return __longlong_as_double(old);
+}
+#endif
+
+// CUDA SpMV COO kernel (double)
+__global__ void spmv_coo_kernel(
+    int nnz, const int* d_row, const int* d_col, const double* d_val,
+    const double* d_x, double* d_y)
+{
+    int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k < nnz) {
+        int row = d_row[k];
+        int col = d_col[k];
+        double val = d_val[k];
+        atomicAdd(&d_y[row], val * d_x[col]);
+    }
+}
+
+// 벡터 내적
+static inline double dot3(const double* a, const double* b) {
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+// 4x4 행렬의 역행렬과 행렬식
+void det_inv_4x4(const double X[4][4], double* det_out, double invX[4][4]) {
+    double A[4][8];
+    for (int i = 0; i < 4; i++) {
+        memcpy(A[i], X[i], 4 * sizeof(double));
+        for (int j = 0; j < 4; j++) A[i][j + 4] = (i == j) ? 1.0 : 0.0;
+    }
+    double det = 1.0;
+    for (int i = 0; i < 4; i++) {
+        int piv = i;
+        for (int r = i + 1; r < 4; r++)
+            if (fabs(A[r][i]) > fabs(A[piv][i])) piv = r;
+        if (piv != i) {
+            for (int c = 0; c < 8; c++) { double tmp = A[i][c]; A[i][c] = A[piv][c]; A[piv][c] = tmp; }
+            det = -det;
+        }
+        double d = A[i][i];
+        if (fabs(d) < 1e-16) { fprintf(stderr, "Singular matrix\n"); exit(EXIT_FAILURE); }
+        det *= d;
+        for (int c = 0; c < 8; c++) A[i][c] /= d;
+        for (int r = 0; r < 4; r++) if (r != i) {
+            double f = A[r][i];
+            for (int c = 0; c < 8; c++) A[r][c] -= f * A[i][c];
+        }
+    }
+    *det_out = det;
+    for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) invX[i][j] = A[i][j + 4];
+}
+
+// SparseEntry 추가 (중복 인덱스 합치기, 0값 저장X)
+void add_sparse(SparseEntry* S, int* nnz, int i, int j, double value) {
+    if (fabs(value) > 1e-14) {
+        for (int idx = 0; idx < *nnz; idx++) {
+            if (S[idx].row == i && S[idx].col == j) {
+                S[idx].value += value;
+                return;
+            }
+        }
+        if (*nnz < MAX_NNZ) {
+            S[*nnz].row = i;
+            S[*nnz].col = j;
+            S[*nnz].value = value;
+            (*nnz)++;
+        } else {
+            printf("Sparse array overflow!\n");
+            exit(1);
+        }
+    }
+}
+
+// PEC 인덱스 무시용
+int is_PEC_edge(int idx, int* pec_idx, int pec_cnt) {
+    for (int i = 0; i < pec_cnt; i++) {
+        if (pec_idx[i] == idx) return 1;
+    }
+    return 0;
+}
+
+int main() {
+    // === 입력 ===
+    FILE* fp;
+    int N0, N1, N3;
+    double* nod_crdn = NULL;
+    int* ele_nod = NULL, * ele_edg = NULL, * pec_edg_idx = NULL;
+    int pec_edg_cnt = 0;
+
+    // nod_crdn.txt
+    fp = fopen("nod_crdn.txt", "r");
+    if (!fp) { perror("nod_crdn.txt"); return 1; }
+    if (fscanf(fp, "%d", &N0) != 1) { fprintf(stderr, "Failed to read node count\n"); fclose(fp); return 1; }
+    nod_crdn = (double*)malloc(3 * N0 * sizeof(double));
+    for (int i = 0; i < N0; i++)
+        fscanf(fp, "%lf %lf %lf", &nod_crdn[3 * i], &nod_crdn[3 * i + 1], &nod_crdn[3 * i + 2]);
+    fclose(fp);
+
+    // edg_nod.txt (생략 가능: edge 개수 파악용)
+    fp = fopen("edg_nod.txt", "r");
+    if (!fp) { perror("edg_nod.txt"); return 1; }
+    if (fscanf(fp, "%d", &N1) != 1) { fprintf(stderr, "Failed to read edge count\n"); fclose(fp); return 1; }
+    fclose(fp);
+
+    // ele_edg.txt
+    fp = fopen("ele_edg.txt", "r");
+    if (!fp) { perror("ele_edg.txt"); return 1; }
+    if (fscanf(fp, "%d", &N3) != 1) { fprintf(stderr, "Failed to read element count\n"); fclose(fp); return 1; }
+    ele_edg = (int*)malloc(6 * N3 * sizeof(int));
+    for (int k = 0; k < N3; k++) {
+        fscanf(fp, "%d %d %d %d %d %d",
+            &ele_edg[6 * k], &ele_edg[6 * k + 1], &ele_edg[6 * k + 2],
+            &ele_edg[6 * k + 3], &ele_edg[6 * k + 4], &ele_edg[6 * k + 5]);
+        for (int a = 0; a < 6; a++) ele_edg[6 * k + a] -= 1;
+    }
+    fclose(fp);
+
+    // ele_nod.txt
+    fp = fopen("ele_nod.txt", "r");
+    if (!fp) { perror("ele_nod.txt"); return 1; }
+    int N3_check;
+    if (fscanf(fp, "%d", &N3_check) != 1 || N3_check != N3) { fprintf(stderr, "Element count mismatch!\n"); fclose(fp); return 1; }
+    ele_nod = (int*)malloc(4 * N3 * sizeof(int));
+    for (int k = 0; k < N3; k++) {
+        fscanf(fp, "%d %d %d %d", &ele_nod[4 * k], &ele_nod[4 * k + 1], &ele_nod[4 * k + 2], &ele_nod[4 * k + 3]);
+        for (int a = 0; a < 4; a++) ele_nod[4 * k + a] -= 1;
+    }
+    fclose(fp);
+
+    // pec_edg_idx_set.txt
+    fp = fopen("pec_edg_idx_set.txt", "r");
+    if (!fp) { perror("pec_edg_idx_set.txt"); return 1; }
+    pec_edg_idx = (int*)malloc(MAX_PEC * sizeof(int));
+    int idx;
+    while (fscanf(fp, "%d", &idx) == 1) pec_edg_idx[pec_edg_cnt++] = idx - 1;
+    fclose(fp);
+
+    // --- [1] Eps mass matrix (Whitney 1-form, edge basis, COO포맷) ---
+    SparseEntry* S_eps = (SparseEntry*)malloc(MAX_NNZ * sizeof(SparseEntry));
+    int nnz_eps = 0;
+
+    for (int elem = 0; elem < N3; elem++) {
+        int* nodes = &ele_nod[4 * elem];
+        double Xmat[4][4], invX[4][4], det;
+        for (int i = 0; i < 4; i++) {
+            Xmat[0][i] = nod_crdn[3 * nodes[i] + 0];
+            Xmat[1][i] = nod_crdn[3 * nodes[i] + 1];
+            Xmat[2][i] = nod_crdn[3 * nodes[i] + 2];
+            Xmat[3][i] = 1.0;
+        }
+        det_inv_4x4(Xmat, &det, invX);
+        double vol = fabs(det) / 6.0;
+
+        double vec_1[3], vec_2[3], vec_3[3], vec_4[3];
+        for (int d = 0; d < 3; d++) {
+            vec_1[d] = invX[0][d];
+            vec_2[d] = invX[1][d];
+            vec_3[d] = invX[2][d];
+            vec_4[d] = invX[3][d];
+        }
+        double scale = 6.0 * vol / 120.0 * eps0;
+
+        double locM[6][6];
+        locM[0][0] = (2 * dot3(vec_2, vec_2) - dot3(vec_2, vec_1) - dot3(vec_1, vec_2) + 2 * dot3(vec_1, vec_1)) * scale;
+        locM[0][1] = (2 * dot3(vec_2, vec_3) - dot3(vec_2, vec_1) - dot3(vec_1, vec_3) + dot3(vec_1, vec_1)) * scale;
+        locM[0][2] = (2 * dot3(vec_2, vec_4) - dot3(vec_2, vec_1) - dot3(vec_1, vec_4) + dot3(vec_1, vec_1)) * scale;
+        locM[0][3] = (dot3(vec_2, vec_3) - dot3(vec_2, vec_2) - 2 * dot3(vec_1, vec_3) + dot3(vec_1, vec_2)) * scale;
+        locM[0][4] = (dot3(vec_2, vec_4) - dot3(vec_2, vec_2) - 2 * dot3(vec_1, vec_4) + dot3(vec_1, vec_2)) * scale;
+        locM[0][5] = (dot3(vec_2, vec_4) - dot3(vec_2, vec_3) - dot3(vec_1, vec_4) + dot3(vec_1, vec_3)) * scale;
+
+        locM[1][0] = locM[0][1];
+        locM[1][1] = (2 * dot3(vec_3, vec_3) - dot3(vec_3, vec_1) - dot3(vec_1, vec_3) + 2 * dot3(vec_1, vec_1)) * scale;
+        locM[1][2] = (2 * dot3(vec_3, vec_4) - dot3(vec_3, vec_1) - dot3(vec_1, vec_4) + dot3(vec_1, vec_1)) * scale;
+        locM[1][3] = (dot3(vec_3, vec_3) - dot3(vec_3, vec_2) - dot3(vec_1, vec_3) + 2 * dot3(vec_1, vec_2)) * scale;
+        locM[1][4] = (dot3(vec_3, vec_4) - dot3(vec_3, vec_2) - dot3(vec_1, vec_4) + 2 * dot3(vec_1, vec_2)) * scale;
+        locM[1][5] = (dot3(vec_3, vec_4) - dot3(vec_3, vec_3) - 2 * dot3(vec_1, vec_4) + dot3(vec_1, vec_3)) * scale;
+
+        locM[2][0] = locM[0][2];
+        locM[2][1] = locM[1][2];
+        locM[2][2] = (2 * dot3(vec_4, vec_4) - dot3(vec_4, vec_1) - dot3(vec_1, vec_4) + 2 * dot3(vec_1, vec_1)) * scale;
+        locM[2][3] = (dot3(vec_4, vec_3) - dot3(vec_4, vec_2) - dot3(vec_1, vec_3) + dot3(vec_1, vec_2)) * scale;
+        locM[2][4] = (dot3(vec_4, vec_4) - dot3(vec_4, vec_2) - dot3(vec_1, vec_4) + 2 * dot3(vec_1, vec_2)) * scale;
+        locM[2][5] = (dot3(vec_4, vec_4) - dot3(vec_4, vec_3) - dot3(vec_1, vec_4) + 2 * dot3(vec_1, vec_3)) * scale;
+
+        locM[3][0] = locM[0][3];
+        locM[3][1] = locM[1][3];
+        locM[3][2] = locM[2][3];
+        locM[3][3] = (2 * dot3(vec_3, vec_3) - dot3(vec_3, vec_2) - dot3(vec_2, vec_3) + 2 * dot3(vec_2, vec_2)) * scale;
+        locM[3][4] = (2 * dot3(vec_3, vec_4) - dot3(vec_3, vec_2) - dot3(vec_2, vec_4) + dot3(vec_2, vec_2)) * scale;
+        locM[3][5] = (dot3(vec_3, vec_4) - dot3(vec_3, vec_3) - 2 * dot3(vec_2, vec_4) + dot3(vec_2, vec_3)) * scale;
+
+        locM[4][0] = locM[0][4];
+        locM[4][1] = locM[1][4];
+        locM[4][2] = locM[2][4];
+        locM[4][3] = locM[3][4];
+        locM[4][4] = (2 * dot3(vec_4, vec_4) - dot3(vec_4, vec_2) - dot3(vec_2, vec_4) + 2 * dot3(vec_2, vec_2)) * scale;
+        locM[4][5] = (dot3(vec_4, vec_4) - dot3(vec_4, vec_3) - dot3(vec_2, vec_4) + 2 * dot3(vec_2, vec_3)) * scale;
+
+        locM[5][0] = locM[0][5];
+        locM[5][1] = locM[1][5];
+        locM[5][2] = locM[2][5];
+        locM[5][3] = locM[3][5];
+        locM[5][4] = locM[4][5];
+        locM[5][5] = (2 * dot3(vec_4, vec_4) - dot3(vec_4, vec_3) - dot3(vec_3, vec_4) + 2 * dot3(vec_3, vec_3)) * scale;
+
+        for (int a = 0; a < 6; a++) {
+            int global_i = ele_edg[6 * elem + a];
+            if (is_PEC_edge(global_i, pec_edg_idx, pec_edg_cnt)) continue;
+            for (int b = 0; b < 6; b++) {
+                int global_j = ele_edg[6 * elem + b];
+                if (is_PEC_edge(global_j, pec_edg_idx, pec_edg_cnt)) continue;
+                add_sparse(S_eps, &nnz_eps, global_i, global_j, locM[a][b]);
+            }
+        }
+    }
+
+    // 인덱스 재정렬
+    int* map_old2new = (int*)malloc(N1 * sizeof(int));
+    int new_idx = 0;
+    for (int i = 0; i < N1; i++)
+        map_old2new[i] = is_PEC_edge(i, pec_edg_idx, pec_edg_cnt) ? -1 : new_idx++;
+    int N1_new = new_idx;
+
+    SparseEntry* S_new = (SparseEntry*)malloc(MAX_NNZ * sizeof(SparseEntry));
+    int nnz_new = 0;
+    for (int k = 0; k < nnz_eps; k++) {
+        int r = map_old2new[S_eps[k].row];
+        int c = map_old2new[S_eps[k].col];
+        if (r == -1 || c == -1) continue;
+        S_new[nnz_new].row = r;
+        S_new[nnz_new].col = c;
+        S_new[nnz_new].value = S_eps[k].value;
+        nnz_new++;
+    }
+
+    // === COO to device vector ===
+    int* h_row = (int*)malloc(nnz_new * sizeof(int));
+    int* h_col = (int*)malloc(nnz_new * sizeof(int));
+    double* h_val = (double*)malloc(nnz_new * sizeof(double));
+    for (int i = 0; i < nnz_new; i++) {
+        h_row[i] = S_new[i].row;
+        h_col[i] = S_new[i].col;
+        h_val[i] = S_new[i].value;
+    }
+    double* h_x = (double*)malloc(N1_new * sizeof(double));
+    for (int i = 0; i < N1_new; i++) h_x[i] = 1.0;
+
+    // === CUDA 메모리 할당/복사 ===
+    int *d_row, *d_col;
+    double *d_val, *d_x, *d_y;
+    CUDA_CHECK(cudaMalloc(&d_row, nnz_new * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_col, nnz_new * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_val, nnz_new * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_x, N1_new * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_y, N1_new * sizeof(double)));
+    CUDA_CHECK(cudaMemcpy(d_row, h_row, nnz_new * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_col, h_col, nnz_new * sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_val, h_val, nnz_new * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_x, h_x, N1_new * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(d_y, 0, N1_new * sizeof(double)));
+
+    // === CUDA 연산시간 측정 ===
+    cudaEvent_t start, stop;
+    float milliseconds = 0;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    int threadsPerBlock = 256;
+    int blocksPerGrid = (nnz_new + threadsPerBlock - 1) / threadsPerBlock;
+
+    cudaEventRecord(start);
+    spmv_coo_kernel<<<blocksPerGrid, threadsPerBlock>>>(nnz_new, d_row, d_col, d_val, d_x, d_y);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&milliseconds, start, stop);
+    printf("\n[CUDA] mass matrix * all-1 vector 연산 시간: %.5f ms\n", milliseconds);
+
+    // === 결과 복사 및 상위 10개 출력 ===
+    double* h_y = (double*)malloc(N1_new * sizeof(double));
+    CUDA_CHECK(cudaMemcpy(h_y, d_y, N1_new * sizeof(double), cudaMemcpyDeviceToHost));
+    printf("[GPU 연산 결과: (Eps_mass * All-1-Vector)]\n");
+    for (int i = 0; i < 10 && i < N1_new; i++)
+        printf("y[%d] = %e\n", i, h_y[i]);
+
+    // === 메모리 해제 ===
+    free(nod_crdn); free(ele_nod); free(ele_edg); free(pec_edg_idx);
+    free(S_eps); free(S_new); free(map_old2new);
+    free(h_row); free(h_col); free(h_val); free(h_x); free(h_y);
+    cudaFree(d_row); cudaFree(d_col); cudaFree(d_val); cudaFree(d_x); cudaFree(d_y);
+
+    return 0;
+}
