@@ -5,7 +5,11 @@
 #include <string.h>
 
 #define MAX_NNZ 3000000
-#define MAX_PEC 50000
+
+static const int edge_lookup[6][2] = {
+    {0, 1}, {0, 2}, {0, 3},
+    {1, 2}, {1, 3}, {2, 3}
+};
 
 static const double PI = 3.14159265358979323846;
 static const double eps0 = 1.0 / (36.0 * PI) * 1e-9;
@@ -66,32 +70,27 @@ void add_sparse(SparseEntry* S, int* nnz, int i, int j, double value) {
     }
 }
 
-// PEC 인덱스면 1, 아니면 0 반환
-int is_PEC_edge(int idx, int* pec_idx, int pec_cnt) {
-    for (int i = 0; i < pec_cnt; i++) {
-        if (pec_idx[i] == idx) return 1;
+double find_sparse(SparseEntry* S, int nnz, int i, int j) {
+    for (int idx = 0; idx < nnz; idx++) {
+        if (S[idx].row == i && S[idx].col == j)
+            return S[idx].value;
     }
-    return 0;
+    return 0.0;
 }
 
 int main(void) {
     FILE* fp;
-    int N0, N1, N3;
+    int N0, N3;
     double* nod_crdn = NULL;
-
     int* ele_nod = NULL;
     int* ele_edg = NULL;
-
-    int* edg_nod = NULL;
-
-    int* pec_edg_idx = NULL;
-    int pec_cnt = 0;
 
     // === nod_crdn.txt ===
     fp = fopen("C:/Users/owner/source/repos/333333/nod_crdn.txt", "r");
     if (!fp) { perror("nod_crdn.txt"); return 1; }
     if (fscanf(fp, "%d", &N0) != 1) { fprintf(stderr, "Failed to read node count\n"); fclose(fp); return 1; }
     nod_crdn = (double*)malloc(3 * N0 * sizeof(double));
+    if (!nod_crdn) { fprintf(stderr, "Memory allocation error\n"); fclose(fp); return 1; }
     for (int i = 0; i < N0; i++) {
         if (fscanf(fp, "%lf %lf %lf", &nod_crdn[3 * i], &nod_crdn[3 * i + 1], &nod_crdn[3 * i + 2]) != 3) {
             fprintf(stderr, "Failed to read node %d\n", i);
@@ -100,66 +99,53 @@ int main(void) {
     }
     fclose(fp);
 
-    // === edg_nod.txt ===
-    fp = fopen("C:/Users/owner/source/repos/333333/edg_nod.txt", "r");
-    if (!fp) { perror("edg_nod.txt"); return 1; }
-    if (fscanf(fp, "%d", &N1) != 1) { fprintf(stderr, "Failed to read edge count\n"); fclose(fp); return 1; }
-    edg_nod = (int*)malloc(2 * N1 * sizeof(int));
-    for (int i = 0; i < N1; i++) {
-        if (fscanf(fp, "%d %d", &edg_nod[2 * i], &edg_nod[2 * i + 1]) != 2) {
-            fprintf(stderr, "Failed to read edge %d\n", i); free(edg_nod); fclose(fp); return 1;
-        }
-        edg_nod[2 * i] -= 1;
-        edg_nod[2 * i + 1] -= 1;
-    }
-    fclose(fp);
-
-    // === ele_edg.txt ===
     fp = fopen("C:/Users/owner/source/repos/333333/ele_edg.txt", "r");
     if (!fp) { perror("ele_edg.txt"); return 1; }
     if (fscanf(fp, "%d", &N3) != 1) { fprintf(stderr, "Failed to read element count\n"); fclose(fp); return 1; }
     ele_edg = (int*)malloc(6 * N3 * sizeof(int));
+    if (!ele_edg) {
+        fprintf(stderr, "Memory allocation error\n");
+        fclose(fp);
+        return 1;
+    }
     for (int k = 0; k < N3; k++) {
         if (fscanf(fp, "%d %d %d %d %d %d", &ele_edg[6 * k], &ele_edg[6 * k + 1], &ele_edg[6 * k + 2], &ele_edg[6 * k + 3], &ele_edg[6 * k + 4], &ele_edg[6 * k + 5]) != 6) {
             fprintf(stderr, "Failed to read element %d\n", k); free(ele_edg); fclose(fp); return 1;
         }
-        for (int a = 0; a < 6; a++) ele_edg[6 * k + a] -= 1;
     }
     fclose(fp);
 
-    // === ele_nod.txt ===
     fp = fopen("C:/Users/owner/source/repos/333333/ele_nod.txt", "r");
     if (!fp) { perror("ele_nod.txt"); free(nod_crdn); return 1; }
-    int N3_check;
-    if (fscanf(fp, "%d", &N3_check) != 1) { fprintf(stderr, "Failed to read element count\n"); fclose(fp); free(nod_crdn); return 1; }
-    if (N3_check != N3) { fprintf(stderr, "Element count mismatch!\n"); fclose(fp); return 1; }
+    if (fscanf(fp, "%d", &N3) != 1) { fprintf(stderr, "Failed to read element count\n"); fclose(fp); free(nod_crdn); return 1; }
     ele_nod = (int*)malloc(4 * N3 * sizeof(int));
+    if (!ele_nod) { fprintf(stderr, "Memory allocation error\n"); fclose(fp); free(nod_crdn); return 1; }
     for (int k = 0; k < N3; k++) {
         if (fscanf(fp, "%d %d %d %d", &ele_nod[4 * k], &ele_nod[4 * k + 1], &ele_nod[4 * k + 2], &ele_nod[4 * k + 3]) != 4) {
             fprintf(stderr, "Failed to read element %d\n", k);
             free(ele_nod); free(nod_crdn); fclose(fp); return 1;
         }
-        for (int a = 0; a < 4; a++) ele_nod[4 * k + a] -= 1;
+        ele_nod[4 * k + 0] -= 1;
+        ele_nod[4 * k + 1] -= 1;
+        ele_nod[4 * k + 2] -= 1;
+        ele_nod[4 * k + 3] -= 1;
     }
     fclose(fp);
 
-    // === pec_edg_idx_set.txt ===
-    fp = fopen("C:/Users/owner/source/repos/333333/pec_edg.txt", "r");
-    if (!fp) { perror("pec_edg.txt"); return 1; }
-    pec_edg_idx = (int*)malloc(MAX_PEC * sizeof(int));
-    int idx;
-    while (fscanf(fp, "%d", &idx) == 1) {
-        pec_edg_idx[pec_cnt++] = idx - 1;
-    }
-    fclose(fp);
+    // ======= 매트랩 local matrix 프린트용 ======
+    int elem_to_print; // 0이면 첫번째 element. 1이면 두번째(인덱스 기준)
+    // =========================================
 
-    // === global mass matrix(희소행렬) 구성 ===
+    // sparse matrix 배열 준비
     SparseEntry* S = (SparseEntry*)malloc(MAX_NNZ * sizeof(SparseEntry));
     int nnz = 0;
+    printf("출력하고 싶은 element 번호(1~N3) 입력: ");
+    scanf("%d", &elem_to_print);
 
-    double Xmat[4][4], invX[4][4], det;
+    double Xmat[4][4], invX[4][4], grads[4][3], det;
     for (int elem = 0; elem < N3; elem++) {
         int* nodes = &ele_nod[4 * elem];
+
         for (int i = 0; i < 4; i++) {
             Xmat[0][i] = nod_crdn[3 * nodes[i] + 0];
             Xmat[1][i] = nod_crdn[3 * nodes[i] + 1];
@@ -177,9 +163,12 @@ int main(void) {
             vec_3[d] = invX[2][d];
             vec_4[d] = invX[3][d];
         }
+
         double scale = 6.0 * vol / 120.0 * eps0;
 
+        // Local mass matrix 수작업 (MATLAB 코드와 매핑)
         double locM[6][6];
+
         locM[0][0] = (2 * dot3(vec_2, vec_2) - dot3(vec_2, vec_1) - dot3(vec_1, vec_2) + 2 * dot3(vec_1, vec_1)) * scale;
         locM[0][1] = (2 * dot3(vec_2, vec_3) - dot3(vec_2, vec_1) - dot3(vec_1, vec_3) + dot3(vec_1, vec_1)) * scale;
         locM[0][2] = (2 * dot3(vec_2, vec_4) - dot3(vec_2, vec_1) - dot3(vec_1, vec_4) + dot3(vec_1, vec_1)) * scale;
@@ -222,57 +211,39 @@ int main(void) {
         locM[5][4] = locM[4][5];
         locM[5][5] = (2 * dot3(vec_4, vec_4) - dot3(vec_4, vec_3) - dot3(vec_3, vec_4) + 2 * dot3(vec_3, vec_3)) * scale;
 
+        // 특정 element의 local matrix 출력
+        
+        if (elem == elem_to_print) {
+            printf("\n--- Local mass matrix for element %d ---\n", elem );
+            for (int p = 0; p < 6; p++) {
+                for (int q = 0; q < 6; q++) {
+                    printf("% .12e ", locM[p][q]);
+                }
+                printf("\n");
+            }
+        }
+
         // sparse matrix에 더하기
         for (int a = 0; a < 6; a++) {
             int global_i = ele_edg[6 * elem + a];
-            if (is_PEC_edge(global_i, pec_edg_idx, pec_cnt)) continue;
             for (int b = 0; b < 6; b++) {
                 int global_j = ele_edg[6 * elem + b];
-                if (is_PEC_edge(global_j, pec_edg_idx, pec_cnt)) continue;
                 add_sparse(S, &nnz, global_i, global_j, locM[a][b]);
             }
         }
     }
 
-    // === 인덱스 재정렬 ===
-    int* map_old2new = (int*)malloc(N1 * sizeof(int));
-    int new_idx = 0;
-    for (int i = 0; i < N1; i++) {
-        if (is_PEC_edge(i, pec_edg_idx, pec_cnt))
-            map_old2new[i] = -1;
-        else
-            map_old2new[i] = new_idx++;
-    }
-    int N1_new = new_idx;
-
-    // === 재정렬된 sparse 저장 ===
-    SparseEntry* S_new = (SparseEntry*)malloc(MAX_NNZ * sizeof(SparseEntry));
-    int nnz_new = 0;
-    for (int k = 0; k < nnz; k++) {
-        int r = map_old2new[S[k].row];
-        int c = map_old2new[S[k].col];
-        if (r == -1 || c == -1) continue;
-        S_new[nnz_new].row = r;
-        S_new[nnz_new].col = c;
-        S_new[nnz_new].value = S[k].value;
-        nnz_new++;
+    // 사용자에게 좌표 입력받아 값 출력
+    int i, j;
+    printf("\nEnter matrix coordinates (i j) to read value: ");
+    if (scanf("%d %d", &i, &j) == 2) {
+        double val = find_sparse(S, nnz, i, j);
+        printf("Value at global_M[%d][%d]: %.12e\n", i, j, val);
     }
 
-    // === 10x10 블록 프린트 ===
-    printf("\nEps_mass_sp_mat (10x10 block, PEC제외:\n");
-    for (int i = 0; i < 10 && i < N1_new; i++) {
-        for (int j = 0; j < 10 && j < N1_new; j++) {
-            double val = 0.0;
-            for (int k = 0; k < nnz_new; k++) {
-                if (S_new[k].row == i && S_new[k].col == j) { val = S_new[k].value; break; }
-            }
-            printf("%12.5e ", val ); // MATLAB과 같은 스케일
-        }
-        printf("\n");
-    }
-    printf("Nonzero nnz count (PEC 제외): %d\n", nnz_new);
-
-    // 메모리 해제
-    free(nod_crdn); free(ele_nod); free(ele_edg); free(edg_nod); free(pec_edg_idx); free(S); free(S_new); free(map_old2new);
+    free(nod_crdn);
+    free(ele_nod);
+    free(ele_edg);
+    free(S);
     return 0;
 }
