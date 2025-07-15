@@ -16,10 +16,12 @@ typedef struct {
     double value;
 } SparseEntry;
 
+// dot3: 3D 벡터 내적
 static inline double dot3(const double* a, const double* b) {
     return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 }
 
+// 4x4 역행렬 및 행렬식 계산
 void det_inv_4x4(const double X[4][4], double* det_out, double invX[4][4]) {
     double A[4][8];
     for (int i = 0; i < 4; i++) {
@@ -48,6 +50,7 @@ void det_inv_4x4(const double X[4][4], double* det_out, double invX[4][4]) {
     for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) invX[i][j] = A[i][j + 4];
 }
 
+// 희소 원소 추가
 void add_sparse(SparseEntry* S, int* nnz, int i, int j, double value) {
     if (fabs(value) > 1e-14) {
         for (int idx = 0; idx < *nnz; idx++) {
@@ -111,7 +114,7 @@ int main() {
         fscanf(fp, "%lf %lf %lf", &nod_crdn[3 * i], &nod_crdn[3 * i + 1], &nod_crdn[3 * i + 2]);
     fclose(fp);
 
-    // edg_nod.txt (생략 가능: edge 개수 파악용)
+    // edg_nod.txt (edge 개수 파악용)
     fp = fopen("edg_nod.txt", "r");
     if (!fp) { perror("edg_nod.txt"); return 1; }
     if (fscanf(fp, "%d", &N1) != 1) { fprintf(stderr, "Failed to read edge count\n"); fclose(fp); return 1; }
@@ -150,7 +153,7 @@ int main() {
     while (fscanf(fp, "%d", &idx) == 1) pec_edg_idx[pec_edg_cnt++] = idx - 1;
     fclose(fp);
 
-    // --- [1] Eps mass matrix (Whitney 1-form, edge basis, COO포맷) ---
+    // --- EPS MASS MATRIX (Whitney 1-form, edge basis, COO) ---
     SparseEntry* S_eps = (SparseEntry*)malloc(MAX_NNZ * sizeof(SparseEntry));
     int nnz_eps = 0;
 
@@ -248,7 +251,7 @@ int main() {
         nnz_new++;
     }
 
-    // === COO 배열에서 CSR로 변환 ===
+    // === COO -> CSR 변환 ===
     int* h_row = (int*)malloc(nnz_new * sizeof(int));
     int* h_col = (int*)malloc(nnz_new * sizeof(int));
     double* h_val = (double*)malloc(nnz_new * sizeof(double));
@@ -263,15 +266,30 @@ int main() {
     double* csr_val = (double*)malloc(nnz_new * sizeof(double));
     coo2csr(N1_new, nnz_new, h_row, h_col, h_val, csr_row_ptr, csr_col_ind, csr_val);
 
-    // --- 상위 10x10 CSR value 출력 ---
-    printf("CSR 상위 10x10 block (row, col, value):\n");
-    for (int i = 0; i < 10 && i < N1_new; i++) {
-        for (int k = csr_row_ptr[i]; k < csr_row_ptr[i + 1]; k++) {
-            int col = csr_col_ind[k];
-            if (col < 10)
-                printf("[%2d %2d] = %.5e\n", i, col, csr_val[k]);
-        }
+    // --- CSR 배열만 깔끔하게 출력 ---
+    printf("\nCSR format arrays:\n");
+    printf("values:   [");
+    int first = 1;
+for (int i = 0; i < csr_row_ptr[10]; i++) {
+    if (csr_col_ind[i] < 10) {
+        printf("%s%.5e", (first ? "" : ", "), csr_val[i]);
+        first = 0;
     }
+}
+    printf("]\n");
+    printf("col_idx:  [");
+    first = 1;
+for (int i = 0; i < csr_row_ptr[10]; i++) {
+    if (csr_col_ind[i] < 10) {
+        printf("%s%d", (first ? "" : ", "), csr_col_ind[i]);
+        first = 0;
+    }
+}
+    printf("]\n");
+    printf("row_ptr:  [");
+    for (int i = 0; i <= 10; i++)
+    printf("%s%d", (i ? ", " : ""), csr_row_ptr[i]);
+    printf("]\n");
 
     // --- 메모리 해제 ---
     free(nod_crdn); free(ele_nod); free(ele_edg); free(pec_edg_idx);
