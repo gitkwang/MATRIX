@@ -1,0 +1,192 @@
+%% 초기화 및 상수
+clear; clc; close all;
+
+[eps_0,mu_0,eta_0,c] = Constants();
+
+% --- 데이터 로드 ---
+load frequency.txt;
+load nod_crdn.txt;
+load ele_fac.txt;
+load ele_edg.txt;
+load ele_nod.txt;
+load fac_edg.txt;
+load fac_nod.txt;
+load edg_nod.txt;
+load PML_cond_set.txt;
+load pec_edg_idx_set.txt;
+load pec_nod_idx_set.txt;
+load pec_fac_idx_set.txt;
+
+load source_edg_idx.txt;    % 1st: edge idx, 2nd: 방향성(1 or -1)
+load bc_opt.txt;            % Neumann BC (1) / Dirichlet BC (2) - PEC
+load eh_a_opt.txt;          % EH (1) / A (2)
+load N_interp.txt;          % field interpolation grid point number
+
+
+load ins_nod_idx_set.txt;    % 1st: edge idx, 2nd: 방향성(1 or -1)
+
+% --- 유전체 노드 집합 로드 (insulator 영역 노드 인덱스) ---
+src1 = readmatrix('source_edg_idx_trl1.txt');
+src2 = readmatrix('source_edg_idx_trl2.txt');   % 반드시 전체 메시 기준 노드 인덱스!
+
+% --- PEC 경계 무시 옵션 처리 ---
+if bc_opt == 1  
+    pec_edg_idx_set = [];
+    pec_nod_idx_set = [];
+    pec_fac_idx_set = [];
+end
+
+% --- Geometry 크기 및 좌표 스케일링 ---
+omega = 2*pi*frequency;
+nod_crdn = nod_crdn(:,1:3)*10;
+
+N_0 = size(nod_crdn,1);
+N_1 = size(edg_nod,1);
+N_2 = size(fac_nod,1);
+N_3 = size(ele_nod,1);
+
+% --- Edge 길이 계산 ---
+edg_length = zeros(N_1,1);
+for i = 1:N_1
+    edg_crdn_1 = nod_crdn(edg_nod(i,1),:);
+    edg_crdn_2 = nod_crdn(edg_nod(i,2),:);    
+    edg_length(i) = norm(edg_crdn_1 - edg_crdn_2);
+end
+
+DT = triangulation(ele_nod, nod_crdn);
+
+disp('X_mat, G_mat, gradient of barycentric coordinates getter...');
+tic
+[X_mat,G_mat,ele_volume] = FEM_3D_X_G_Mat_Gen(N_3, ele_nod, nod_crdn);
+toc
+
+disp('Center coordinates of cells...');
+[ele_cent_crdn, fac_cent_crdn, edg_cent_crdn] = Center_coordinate(N_3, N_2, N_1, nod_crdn, ele_nod, fac_nod, edg_nod);
+
+% Whitney 1 and 2 forms unit vectors for all edges and faces
+[Wh_1_t_unit_vec, Wh_2_n_unit_vec] = Whitney_1_2_forms_unit_vec(N_1, N_2, nod_crdn, edg_nod, fac_nod);
+
+%% === Dielectric (유전체) 영역 상대 유전율 적용 ===
+ins_eps = 4.0;  % 유전체 상대 유전율 (예시, 필요시 수정)
+eps_r = ones(N_3,1);   % 모든 요소 air (1.0)로 초기화
+
+% 유전체 element 구분: 모든 노드가 ins_nod_idx_set에 포함된 경우만 insulator로 간주 (전체 메시 기준!)
+is_ins_elem = all(ismember(ele_nod, ins_nod_idx_set'), 2);  % N_3 x 1 논리형
+eps_r(is_ins_elem) = ins_eps;  % insulator volume 전체(내부+경계)에 적용
+
+% 상대 투자율도 air로 초기화 (필요 시 수정)
+mu_r = ones(N_3,1);
+
+
+trl1_edges = src1(:,1);
+trl1_signs = src1(:,2);
+trl2_edges = src2(:,1);
+trl2_signs = src2(:,2);
+
+%% Point current source (여러 edge 지원)
+f_vec_sp = sparse(N_1,1);
+
+% 4. 입력(TRL1) edge set에 균등 분포
+I0 = 1;  % 전체 인가 전류(원하는 값)
+N1 = length(trl1_edges);
+f_vec_sp(trl1_edges) = (I0/N1) .* trl1_signs;
+
+% 5. 출력(TRL2) edge set에도 균등 분포, 부호 - (디퍼런셜 모드라면)
+I1 = 1;  % 출력단에 원하는 전류 (보통 -I0)
+N2 = length(trl2_edges);
+f_vec_sp(trl2_edges) = f_vec_sp(trl2_edges) + (-I1/N2) .* trl2_signs;
+
+
+
+%% FEM system matrix
+disp('Incidence Curl matrix');
+tic
+inc_curl_sp_mat = Incidence_Curl_Mat_Gen(N_2, N_1, fac_edg);
+inc_curl_sp_mat(pec_fac_idx_set, pec_edg_idx_set) = 0;
+inc_curl_dual_sp_mat = transpose(inc_curl_sp_mat);
+toc
+
+disp('Incidence Grad matrix');
+tic
+inc_grad_sp_mat = Incidence_Grad_Mat_Gen(N_1, N_0, edg_nod);
+inc_div_dual_sp_mat = transpose(inc_grad_sp_mat);
+inc_div_dual_sp_mat(pec_nod_idx_set, pec_edg_idx_set) = 0;
+inc_grad_sp_mat = transpose(inc_div_dual_sp_mat);
+toc
+
+disp('Mu inv mass matrix...');
+tic
+mu_inv_mass_sp_mat = Mu_inv_mass_Mat_Gen_PML(N_2, N_3, ele_fac, ele_volume, G_mat, PML_cond_set, omega, pec_fac_idx_set);
+toc
+
+disp('Eps mass matrix...');
+tic
+eps_mass_sp_mat = Eps_mass_Mat_Gen_PML(N_1, N_3, ele_edg, ele_volume, eps_0, G_mat, PML_cond_set, omega, eps_r, pec_edg_idx_set);
+toc
+
+disp('Chi mass matrix...');
+tic
+[chi_mass_sp_mat, chi_inv_mass_sp_mat] = Chi_inv_mass_Mat_Gen_PML(N_0, N_3, ele_nod, ele_volume, PML_cond_set, eps_r, mu_r, omega, pec_nod_idx_set);
+toc
+
+disp('System matrix...');
+tic
+A_mat_sp = inc_curl_dual_sp_mat * mu_inv_mass_sp_mat * inc_curl_sp_mat;
+B_mat_sp = -omega^2 * eps_mass_sp_mat;
+C_mat_sp = -eps_mass_sp_mat * inc_grad_sp_mat * chi_inv_mass_sp_mat * inc_div_dual_sp_mat * eps_mass_sp_mat;
+if eh_a_opt == 1        % EH solver
+    sys_sp_mat = A_mat_sp + B_mat_sp + C_mat_sp*0;
+    f_vec_sp = 1i*omega*f_vec_sp;
+elseif eh_a_opt == 2    % LG-A solver    
+    sys_sp_mat = A_mat_sp + B_mat_sp + C_mat_sp;
+end
+sys_sp_mat(pec_edg_idx_set, pec_edg_idx_set) = 0;
+idx = pec_edg_idx_set(:);
+sys_sp_mat = sys_sp_mat + sparse(idx, idx, 1, size(sys_sp_mat,1), size(sys_sp_mat,2));
+sys_sp_mat = (sys_sp_mat + transpose(sys_sp_mat))/2;
+toc   
+
+%% Linear solver
+disp('Linear solver...');
+tic
+x_vec = sys_sp_mat \ f_vec_sp;
+toc
+
+if eh_a_opt == 1
+    e_vec = x_vec;
+elseif eh_a_opt == 2
+    a_vec = x_vec;
+    phi_vec = 1/(1i*omega)*chi_inv_mass_sp_mat*inc_div_dual_sp_mat*eps_mass_sp_mat*x_vec;
+    e_vec = 1i*omega*a_vec - inc_grad_sp_mat*phi_vec;
+end    
+
+%% Interpolation of field
+L_interp = 2*max(nod_crdn(:));
+
+% Scattering field (예: 3개 평면)
+for plane_opt = 1:3
+    [xq,yq,zq,Scat_E_x,Scat_E_y,Scat_E_z] = Scattered_field_interpolation_2_Plane(N_interp,L_interp,DT,G_mat,e_vec,ele_edg,plane_opt);
+    
+    tot_E_field_amp=sqrt( abs(Scat_E_x).^2+abs(Scat_E_y).^2+abs(Scat_E_z).^2 );
+    
+    figure;
+    if plane_opt == 1
+        surf(xq,yq,log10(tot_E_field_amp'),'EdgeColor','none');
+        xlabel('x'); ylabel('y');        
+    elseif plane_opt == 2
+        surf(yq,zq,log10(tot_E_field_amp'),'EdgeColor','none');
+        xlabel('y'); ylabel('z');        
+    elseif plane_opt == 3
+        surf(xq,zq,log10(tot_E_field_amp'),'EdgeColor','none');
+        xlabel('x'); ylabel('z');        
+    end
+    colormap(hot);
+    cb = colorbar;
+    cb.Label.String = 'E-field amplitude (dB)';
+    set(gca,'fontsize',13);        
+    view(2);
+    axis equal;    
+    savename = append('E_field_amp_',num2str(plane_opt),'_',num2str(eh_a_opt),'.png');
+    print(savename,'-dpng','-r500');
+    drawnow;
+end
