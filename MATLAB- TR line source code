@@ -1,0 +1,61 @@
+% 1. 데이터 읽기
+nod_crdn = readmatrix('nod_crdn.txt'); % (N_nodes x 3)
+edg_nod = readmatrix('edg_nod.txt');   % (N_edges x 2)
+
+% --- geometry 파라미터 (네 geometry에 맞게 수정!) ---
+TR1_x = [4, 4.5];
+TR2_x = [5.5, 6];
+TR_y  = [1, 9];
+TR_z  = [4.5, 5.1];
+INS_z = [3, 4.5];
+tol = 1e-3;
+
+% 2. 접촉 edge 후보 뽑기 (TR 라인-Insulator 경계 edge 모두 추출)
+source_edges = [];
+for i = 1:size(edg_nod,1)
+    idx1 = edg_nod(i,1);  idx2 = edg_nod(i,2);
+    p1 = nod_crdn(idx1,:); p2 = nod_crdn(idx2,:);
+    % TRL1 <-> insulator
+    trl1_contact = ...
+        ( (p1(1) >= TR1_x(1)-tol && p1(1) <= TR1_x(2)+tol) && ...
+          (p2(1) >= TR1_x(1)-tol && p2(1) <= TR1_x(2)+tol) && ...
+          (p1(2) >= TR_y(1)-tol && p1(2) <= TR_y(2)+tol) && ...
+          (p2(2) >= TR_y(1)-tol && p2(2) <= TR_y(2)+tol) && ...
+          ( (abs(p1(3)-TR_z(1))<tol && abs(p2(3)-INS_z(2))<tol) || ...
+            (abs(p2(3)-TR_z(1))<tol && abs(p1(3)-INS_z(2))<tol) ) );
+    % TRL2 <-> insulator
+    trl2_contact = ...
+        ( (p1(1) >= TR2_x(1)-tol && p1(1) <= TR2_x(2)+tol) && ...
+          (p2(1) >= TR2_x(1)-tol && p2(1) <= TR2_x(2)+tol) && ...
+          (p1(2) >= TR_y(1)-tol && p1(2) <= TR_y(2)+tol) && ...
+          (p2(2) >= TR_y(1)-tol && p2(2) <= TR_y(2)+tol) && ...
+          ( (abs(p1(3)-TR_z(1))<tol && abs(p2(3)-INS_z(2))<tol) || ...
+            (abs(p2(3)-TR_z(1))<tol && abs(p1(3)-INS_z(2))<tol) ) );
+    if trl1_contact || trl2_contact
+        edge_center_y = mean([p1(2), p2(2)]);
+        which_trl = 1*trl1_contact + 2*trl2_contact;
+        source_edges = [source_edges; i, edge_center_y, which_trl];
+    end
+end
+
+% 3. TRL1, TRL2 그룹별로 분리하여 전체 edge 인덱스 파일로 저장
+trl1_edges = source_edges(source_edges(:,3)==1,:);  % TRL1-Insulator 경계 edge set
+trl2_edges = source_edges(source_edges(:,3)==2,:);  % TRL2-Insulator 경계 edge set
+
+if ~isempty(trl1_edges)
+    trl1_src = [trl1_edges(:,1), ones(size(trl1_edges,1),1)]; % [edge_idx, sign=1]
+    writematrix(trl1_src, 'source_edg_idx_trl1.txt');
+    disp(['TRL1-Insulator 경계 edge 개수: ', num2str(size(trl1_src,1))]);
+else
+    disp('TRL1-Insulator 경계 edge가 발견되지 않았습니다!');
+end
+
+if ~isempty(trl2_edges)
+    trl2_src = [trl2_edges(:,1), ones(size(trl2_edges,1),1)]; % [edge_idx, sign=1]
+    writematrix(trl2_src, 'source_edg_idx_trl2.txt');
+    disp(['TRL2-Insulator 경계 edge 개수: ', num2str(size(trl2_src,1))]);
+else
+    disp('TRL2-Insulator 경계 edge가 발견되지 않았습니다!');
+end
+
+disp('TRL1/TRL2 전체 경계 edge source 파일 생성 완료!');
